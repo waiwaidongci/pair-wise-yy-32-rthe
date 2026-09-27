@@ -1,1 +1,65 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title>
+<style>
+body{font:15px system-ui;max-width:1100px;margin:28px auto;padding:0 20px;color:#1f2933}
+button{padding:6px 12px;cursor:pointer}
+.batch{border:1px solid #d4dae0;border-radius:8px;padding:12px 16px;margin:10px 0;cursor:pointer;background:#fff}
+.batch:hover{border-color:#5b8def}
+.meta{color:#64717d;font-size:13px}
+.tag{display:inline-block;border-radius:10px;padding:1px 10px;font-size:12px;margin-left:6px}
+.tag.state{background:#eef2f7}
+.tag.current{background:#e3f1ff;color:#0b5cab}
+.tag.archived{background:#f1f1f1;color:#7a8694}
+.baseline{border-left:4px solid #c9d2dc;background:#fafbfc;padding:10px 14px;margin:10px 0;border-radius:0 6px 6px 0}
+.baseline.current{border-left-color:#2f7ed8;background:#f3f9ff}
+.warn{background:#fdecec;border-left-color:#d64545}
+.pill{display:inline-block;border-radius:10px;padding:1px 9px;font-size:12px;margin-right:6px}
+.pill.ok{background:#e2f5e6;color:#1c7a37}
+.pill.bad{background:#fbdcdc;color:#a51c1c}
+.pill.miss{background:#fdeccd;color:#8a5a00}
+pre{background:#f3f5f7;padding:10px;overflow:auto;font-size:12px}
+h3{margin:18px 0 6px}
+</style>
+<h1>药品生产偏差与批次放行</h1>
+<p>每次返工完成即产生新的检验基线；旧结果仅留追溯。当前基线缺项或仍有不合格项时，QA 的拒绝说明会标注基线与缺少项。</p>
+<button onclick="loadState()">刷新状态</button>
+<div id="root">加载中...</div>
+<script>
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const STATE_CN = {manufactured:"已生产",investigation:"调查中",awaiting_resample:"待再取样",conditional:"有条件放行",released:"正式放行",rejected:"拒绝"};
+async function loadState(){
+  root.textContent = "加载中...";
+  const s = await (await fetch("/api/state")).json();
+  if(!s.batches.length){ root.innerHTML = "<p>暂无批次</p>"; return; }
+  root.innerHTML = s.batches.map(b => `<div class="batch" onclick="loadBatch(${b.id})"><b>${esc(b.batch_no)}</b> · ${esc(b.product)}
+    <span class="tag state">${STATE_CN[b.state] || b.state}</span>
+    <div class="meta">工厂 #${b.factory_id} · 修订 ${b.revision} · 点击查看检验基线</div></div>`).join("");
+  loadBatch(s.batches[0].id);
+}
+async function loadBatch(id){
+  const d = await (await fetch(`/api/batches/${id}`)).json();
+  const cb = d.current_baseline, b = d.batch;
+  const problems = [...cb.missing.map(t => `<span class="pill miss">缺少：${esc(t)}</span>`),
+                    ...cb.failed.map(t => `<span class="pill bad">不合格：${esc(t)}</span>`)].join(" ") ||
+                    (cb.required.length ? `<span class="pill ok">当前基线项目齐全</span>` : `<span class="pill miss">尚无检验结果</span>`);
+  const baselines = d.baselines.map(g => {
+    const tag = g.current ? `<span class="tag current">当前基线</span>` : `<span class="tag archived">历史追溯</span>`;
+    const st = g.rework_status ? ` · 返工状态：${g.rework_status === "planned" ? "计划中" : "已完成"}` : "";
+    const rows = g.tests.length ? g.tests.map(t => `<tr><td>${esc(t.test_type)}</td><td>${esc(t.result)}</td>
+      <td>[${esc(t.spec_min)}, ${esc(t.spec_max)}]</td><td>第 ${t.round} 次</td>
+      <td><span class="pill ${t.passed ? "ok" : "bad"}">${t.passed ? "合格" : "不合格"}</span></td></tr>`).join("")
+      : `<tr><td colspan="5" class="meta">该基线尚无补录结果</td></tr>`;
+    return `<div class="baseline ${g.current ? (cb.missing.length || cb.failed.length ? "warn current" : "current") : ""}">
+      <b>${esc(g.label)}</b>${tag}<span class="meta">${st}${g.rework_id ? ` · 返工 #${g.rework_id}` : ""}</span>
+      <table border="0" style="border-collapse:collapse;width:100%;margin-top:6px;font-size:13px">
+      <tr style="text-align:left;color:#64717d"><th>项目</th><th>结果</th><th>标准</th><th>复测</th><th>判定</th></tr>${rows}</table></div>`;
+  }).join("");
+  const el = document.createElement("div");
+  el.innerHTML = `<h3>${esc(b.batch_no)} · ${esc(b.product)} <span class="tag state">${STATE_CN[b.state] || b.state}</span></h3>
+    <p class="meta">当前基线：<b>${esc(cb.baseline.label)}</b>${cb.baseline.rework_id ? `（返工 #${cb.baseline.rework_id}）` : ""} · 必检项目：${cb.required.map(esc).join("、") || "—"}</p>
+    <p>${problems}</p>${baselines}
+    <details><summary class="meta">返工 / 决定记录</summary><pre>${esc(JSON.stringify({rework:d.rework, decisions:d.decisions}, null, 2))}</pre></details>`;
+  const old = document.getElementById("detail"); if(old) old.remove();
+  el.id = "detail"; root.insertAdjacentElement("afterend", el);
+}
+loadState();
+</script></html>
