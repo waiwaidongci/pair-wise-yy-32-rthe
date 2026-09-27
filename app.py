@@ -64,11 +64,14 @@ class Store:
         CREATE TABLE IF NOT EXISTS tests (
           id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id),
           test_type TEXT NOT NULL, result REAL NOT NULL, spec_min REAL NOT NULL, spec_max REAL NOT NULL,
-          passed INTEGER NOT NULL, round INTEGER NOT NULL DEFAULT 1, recorded_by TEXT NOT NULL, created_at TEXT NOT NULL
+          passed INTEGER NOT NULL, round INTEGER NOT NULL DEFAULT 1,
+          rework_id INTEGER REFERENCES rework(id), baseline_no INTEGER NOT NULL DEFAULT 0,
+          recorded_by TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS rework (
           id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER NOT NULL REFERENCES batches(id),
           description TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('planned','completed')),
+          baseline_no INTEGER NOT NULL DEFAULT 0,
           created_by TEXT NOT NULL, created_at TEXT NOT NULL, completed_by TEXT, completed_at TEXT
         );
         CREATE TABLE IF NOT EXISTS supplier_changes (
@@ -91,6 +94,19 @@ class Store:
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        # 旧库迁移：补列并把返工前的检验结果全部归入初始基线（仅留追溯）
+        rework_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(rework)")}
+        if "baseline_no" not in rework_cols:
+            self.conn.execute("ALTER TABLE rework ADD COLUMN baseline_no INTEGER NOT NULL DEFAULT 0")
+        test_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(tests)")}
+        if "rework_id" not in test_cols:
+            self.conn.execute("ALTER TABLE tests ADD COLUMN rework_id INTEGER REFERENCES rework(id)")
+        if "baseline_no" not in test_cols:
+            self.conn.execute("ALTER TABLE tests ADD COLUMN baseline_no INTEGER NOT NULL DEFAULT 0")
+        # 已有返工按计划先后补编基线号，使其成为各自批次的新检验基线
+        for rid, bid in self.conn.execute("SELECT id,batch_id FROM rework ORDER BY id"):
+            taken = self.conn.execute("SELECT COALESCE(MAX(baseline_no),0) FROM rework WHERE batch_id=?", (bid,)).fetchone()[0]
+            self.conn.execute("UPDATE rework SET baseline_no=? WHERE id=? AND baseline_no=0", (taken + 1, rid))
         self.conn.commit()
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
@@ -180,28 +196,49 @@ class BatchService:
             self.store.audit(actor, "deviation.exception", "deviation", deviation_id, {"batch_id": batch["id"], "reason": reason, "until": until})
         return self._deviation_dict(self._row("deviations", deviation_id))
 
-    def record_test(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, test_type: str, result: float, spec_min: float, spec_max: float, expected_revision: int) -> dict:
+    def record_test(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, test_type: str, result: float, spec_min: float, spec_max: float, expected_revision: int, rework_id: int | None = None) -> dict:
         actor = self._actor(actor, role, {"lab"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
         if not test_type.strip() or spec_min > spec_max: raise ApiError(400, "检验项目或标准不合法")
         if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不能补录检验")
-        round_no = self.conn.execute("SELECT COALESCE(MAX(round),0)+1 FROM tests WHERE batch_id=? AND test_type=?", (batch_id, test_type)).fetchone()[0]
+        # 判断层：确定本次补录归属的检验基线
+        latest_rework = self.conn.execute("SELECT * FROM rework WHERE batch_id=? ORDER BY id DESC LIMIT 1", (batch_id,)).fetchone()
+        if latest_rework is not None and latest_rework["status"] == "planned":
+            raise ApiError(409, f"返工 R{latest_rework['baseline_no']}（返工记录 {latest_rework['id']}）尚未完成，不能提前取样检验，请先完成返工")
+        if rework_id in (None, 0):
+            if latest_rework is not None:
+                raise ApiError(400, f"当前批次已建立返工检验基线 R{latest_rework['baseline_no']}（返工记录 {latest_rework['id']}），补录检验必须携带 rework_id；返工前结果只留追溯")
+            baseline_no, bound_rework_id = 0, None
+        else:
+            target = self.conn.execute("SELECT * FROM rework WHERE id=?", (rework_id,)).fetchone()
+            if not target or int(target["batch_id"]) != int(batch_id): raise ApiError(404, "返工记录不存在或不属于该批次")
+            if target["status"] != "completed": raise ApiError(409, f"返工 R{target['baseline_no']}（返工记录 {target['id']}）尚未完成，不能补录检验")
+            if latest_rework is None or int(target["id"]) != int(latest_rework["id"]):
+                raise ApiError(409, f"返工 R{target['baseline_no']}（返工记录 {target['id']}）已不是当前检验基线，其结果只留追溯，请按当前返工 R{latest_rework['baseline_no']}（返工记录 {latest_rework['id']}）补录")
+            baseline_no, bound_rework_id = int(target["baseline_no"]), int(target["id"])
+        # 轮次在基线内单独计数，连续返工的复测不会再混在一起
+        round_no = self.conn.execute("SELECT COALESCE(MAX(round),0)+1 FROM tests WHERE batch_id=? AND baseline_no=? AND test_type=?",
+                                    (batch_id, baseline_no, test_type)).fetchone()[0]
         passed = int(spec_min <= result <= spec_max)
         with self.conn:
-            cur = self.conn.execute("""INSERT INTO tests(batch_id,test_type,result,spec_min,spec_max,passed,round,recorded_by,created_at)
-                                     VALUES(?,?,?,?,?,?,?,?,?)""", (batch_id, test_type, result, spec_min, spec_max, passed, round_no, actor, now()))
+            cur = self.conn.execute("""INSERT INTO tests(batch_id,test_type,result,spec_min,spec_max,passed,round,rework_id,baseline_no,recorded_by,created_at)
+                                     VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (batch_id, test_type, result, spec_min, spec_max, passed, round_no, bound_rework_id, baseline_no, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation" if (batch["state"] == "awaiting_resample" or not passed) else batch["state"])
-            self.store.audit(actor, "test.record", "batch", batch_id, {"test_type": test_type, "result": result, "passed": bool(passed), "round": round_no})
+            self.store.audit(actor, "test.record", "batch", batch_id, {"test_type": test_type, "result": result, "passed": bool(passed), "round": round_no, "baseline_no": baseline_no, "rework_id": bound_rework_id})
         return self._test_dict(self._row("tests", cur.lastrowid))
 
     def plan_rework(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, description: str, expected_revision: int) -> dict:
         actor = self._actor(actor, role, {"operator"})
         batch = self._row("batches", batch_id); self._factory_check(actor, factory_id, batch)
         if batch["state"] in {"released", "rejected"}: raise ApiError(409, "终态批次不能返工")
+        # 计划一旦建立就成为该批次的新检验基线；旧结果从此只留追溯，不再支撑放行
         with self.conn:
-            cur = self.conn.execute("INSERT INTO rework(batch_id,description,status,created_by,created_at) VALUES(?,?,'planned',?,?)", (batch_id, description, actor, now()))
+            baseline_no = self.conn.execute("SELECT COALESCE(MAX(baseline_no),0)+1 FROM rework WHERE batch_id=?", (batch_id,)).fetchone()[0]
+            cur = self.conn.execute("INSERT INTO rework(batch_id,description,status,baseline_no,created_by,created_at) VALUES(?,?,'planned',?,?,?)",
+                                    (batch_id, description, baseline_no, actor, now()))
             self._advance_batch(batch_id, expected_revision, "investigation")
-            self.store.audit(actor, "rework.plan", "rework", cur.lastrowid, {"batch_id": batch_id, "description": description})
+            self.store.audit(actor, "rework.plan", "rework", cur.lastrowid, {"batch_id": batch_id, "description": description, "baseline_no": baseline_no})
         return dict(self._row("rework", cur.lastrowid))
 
     def complete_rework(self, actor: str | None, role: str | None, factory_id: int, rework_id: int, expected_revision: int) -> dict:
@@ -210,8 +247,9 @@ class BatchService:
         if row["status"] != "planned": raise ApiError(409, "返工记录已经完成")
         with self.conn:
             self.conn.execute("UPDATE rework SET status='completed',completed_by=?,completed_at=? WHERE id=?", (actor, now(), rework_id))
-            self._advance_batch(batch["id"], expected_revision, "investigation")
-            self.store.audit(actor, "rework.complete", "rework", rework_id, {"batch_id": batch["id"]})
+            # 返工完成后必须重新取样：批次进入再取样，实验室按本次返工基线补录
+            self._advance_batch(batch["id"], expected_revision, "awaiting_resample")
+            self.store.audit(actor, "rework.complete", "rework", rework_id, {"batch_id": batch["id"], "baseline_no": row["baseline_no"]})
         return dict(self._row("rework", rework_id))
 
     def record_supplier_change(self, actor: str | None, role: str | None, factory_id: int, batch_id: int, supplier: str, change_type: str, description: str, expected_revision: int) -> dict:
@@ -244,13 +282,28 @@ class BatchService:
         if not rationale.strip(): raise ApiError(400, "必须填写决定依据")
         deviations = self.conn.execute("SELECT * FROM deviations WHERE batch_id=? ORDER BY id", (batch_id,)).fetchall()
         open_deviations = [d for d in deviations if d["status"] == "open"]
-        latest_tests: dict[str, sqlite3.Row] = {}
-        for row in self.conn.execute("SELECT * FROM tests WHERE batch_id=? ORDER BY id", (batch_id,)):
-            latest_tests[row["test_type"]] = row
-        if decision in {"release", "conditional"} and not latest_tests:
-            raise ApiError(409, "放行前至少需要一项检验结果")
-        if decision in {"release", "conditional"} and any(not row["passed"] for row in latest_tests.values()):
-            raise ApiError(409, "最新检验结果仍有不合格项")
+        # 只以当前检验基线的结果为放行依据；历史基线的复测仅用于追溯
+        latest_rework = self.conn.execute("SELECT * FROM rework WHERE batch_id=? ORDER BY id DESC LIMIT 1", (batch_id,)).fetchone()
+        if latest_rework is not None and latest_rework["status"] == "planned":
+            raise ApiError(409, f"返工 R{latest_rework['baseline_no']}（返工记录 {latest_rework['id']}）尚未完成，不能放行或有条件放行")
+        baseline_no = int(latest_rework["baseline_no"]) if latest_rework is not None else 0
+        marker = f"返工基线 R{baseline_no}（返工记录 {latest_rework['id']}）" if latest_rework is not None else "初始检验基线（返工前）"
+        baseline_tests: dict[str, sqlite3.Row] = {}
+        for row in self.conn.execute("SELECT * FROM tests WHERE batch_id=? AND baseline_no=? ORDER BY id", (batch_id, baseline_no)):
+            baseline_tests[row["test_type"]] = row
+        if decision in {"release", "conditional"}:
+            required = {r[0] for r in self.conn.execute("SELECT DISTINCT test_type FROM tests WHERE batch_id=?", (batch_id,))}
+            problems: list[str] = []
+            missing = sorted(required - set(baseline_tests))
+            if missing:
+                problems.append(f"缺少检验结果：{ '、'.join(missing) }")
+            elif not baseline_tests:
+                problems.append("尚无检验结果")
+            failed = sorted(name for name, row in baseline_tests.items() if not row["passed"])
+            if failed:
+                problems.append(f"仍有不合格检验项目：{ '、'.join(failed) }")
+            if problems:
+                raise ApiError(409, f"{marker}{'；'.join(problems)}；返工前结果只留追溯，不能作为放行依据，请按该基线重新取样补录")
         if decision == "resample":
             if batch["state"] == "conditional": raise ApiError(409, "有条件放行后不能直接改为再取样")
             new_state = "awaiting_resample"
@@ -305,7 +358,8 @@ class BatchService:
     @staticmethod
     def _test_dict(row: sqlite3.Row) -> dict:
         return {"id": row["id"], "batch_id": row["batch_id"], "test_type": row["test_type"], "result": row["result"],
-                "spec_min": row["spec_min"], "spec_max": row["spec_max"], "passed": bool(row["passed"]), "round": row["round"]}
+                "spec_min": row["spec_min"], "spec_max": row["spec_max"], "passed": bool(row["passed"]), "round": row["round"],
+                "rework_id": row["rework_id"], "baseline_no": row["baseline_no"]}
 
     def state(self) -> dict:
         return {"factories": [dict(row) for row in self.conn.execute("SELECT * FROM factories ORDER BY id")],
@@ -327,6 +381,11 @@ class Handler(BaseHTTPRequestHandler):
         size = int(self.headers.get("Content-Length", "0"))
         try: return json.loads(self.rfile.read(size)) if size else {}
         except json.JSONDecodeError as exc: raise ApiError(400, "JSON 请求体无效") from exc
+    @staticmethod
+    def _rework_id(raw: object) -> int | None:
+        if raw in (None, "", 0, "0"): return None
+        try: return int(raw)
+        except (TypeError, ValueError) as exc: raise ApiError(400, "返工记录编号不合法") from exc
     def _parts(self) -> list[str]: return [p for p in urlparse(self.path).path.strip("/").split("/") if p]
 
     def do_GET(self) -> None:
@@ -350,7 +409,7 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "deviations": out = self.service.add_deviation(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("severity", ""), b.get("title", ""), b.get("due_at"), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "deviations"] and p[3] == "close": out = self.service.close_deviation(actor, role, int(p[2]), b.get("corrective_action", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "deviations"] and p[3] == "exception": out = self.service.approve_exception(actor, role, int(p[2]), b.get("reason", ""), b.get("until", ""), int(b.get("expected_revision", -1)))
-            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "tests": out = self.service.record_test(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("test_type", ""), float(b.get("result", 0)), float(b.get("spec_min", 0)), float(b.get("spec_max", 0)), int(b.get("expected_revision", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "tests": out = self.service.record_test(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("test_type", ""), float(b.get("result", 0)), float(b.get("spec_min", 0)), float(b.get("spec_max", 0)), int(b.get("expected_revision", -1)), self._rework_id(b.get("rework_id")))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "rework": out = self.service.plan_rework(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("description", ""), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "rework"] and p[3] == "complete": out = self.service.complete_rework(actor, role, int(b.get("factory_id", 0)), int(p[2]), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "batches"] and p[3] == "supplier-changes": out = self.service.record_supplier_change(actor, role, int(b.get("factory_id", 0)), int(p[2]), b.get("supplier", ""), b.get("change_type", ""), b.get("description", ""), int(b.get("expected_revision", -1)))

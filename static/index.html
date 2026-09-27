@@ -1,1 +1,62 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>药品生产偏差与批次放行</h1><p>偏差、检验、返工、供应商变更和稳定性数据共同约束质量放行。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>批次放行</title>
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px;color:#1f2933}
+h1{margin-bottom:4px}.muted{color:#6b7280}
+button{padding:6px 12px;margin:2px 6px 2px 0;cursor:pointer}
+.card{border:1px solid #d4d9df;border-radius:8px;padding:14px 16px;margin:12px 0}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;margin-right:6px}
+.current{background:#dcfce7;color:#166534}.archive{background:#f1f3f5;color:#6b7280}
+.planned{background:#fef3c7;color:#92400e}.bad{background:#fee2e2;color:#991b1b;font-weight:600}
+table{border-collapse:collapse;width:100%;margin-top:6px}td,th{border:1px solid #e3e7ec;padding:4px 8px;text-align:left;font-size:14px}
+.warn{background:#fff7ed;border-left:4px solid #f59e0b;padding:8px 12px;margin:8px 0}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+</style>
+<h1>药品生产偏差与批次放行</h1>
+<p class="muted">每次返工都是新的检验基线：计划建立后，旧检验结果仅留追溯；返工完成需重新取样，由实验室按本次返工补录。</p>
+<button onclick="loadState()">刷新状态</button>
+<div id="list"></div><div id="detail"></div>
+<script>
+const $=s=>document.querySelector(s);
+async function getJson(u){return (await fetch(u)).json()}
+async function loadState(){
+  const st=await getJson('/api/state');
+  $('#list').innerHTML='<h2>批次</h2>'+st.batches.map(b=>
+    `<div class="card">批次 <b>${b.batch_no}</b>（工厂 ${b.factory_id}，${b.product}） 状态：<b>${b.state}</b> 修订号：${b.revision}
+     <br><button onclick="loadBatch(${b.id})">查看检验基线与历史复测</button></div>`).join('');
+}
+async function loadBatch(id){
+  const d=await getJson('/api/batches/'+id), b=d.batch;
+  const reworks=[...d.rework].sort((a,b)=>b.id-a.id);
+  const latest=reworks[0]||null;
+  const curBaseline=latest?latest.baseline_no:0;
+  // 页面侧展示计算：当前基线缺少项与不合格项
+  const required=[...new Set(d.tests.map(t=>t.test_type))].sort();
+  const curTests=d.tests.filter(t=>t.baseline_no===curBaseline);
+  const curTypes=new Set(curTests.map(t=>t.test_type));
+  const missing=required.filter(x=>!curTypes.has(x));
+  const failing=curTests.filter(t=>!t.passed).map(t=>t.test_type);
+  const blocked=[...(missing.length?['<span class="bad">缺少检验结果：'+missing.join('、')+'</span>']:[]),
+                 ...(failing.length?['<span class="bad">仍有不合格项目：'+[...new Set(failing)].join('、')+'</span>']:[])];
+  const reworkHtml=reworks.length?'<table><tr><th>基线标识</th><th>返工记录</th><th>说明</th><th>状态</th></tr>'+
+    reworks.map(r=>`<tr><td><span class="badge ${r.id===latest.id?'current':'archive'}">${r.id===latest.id?'当前基线 R'+r.baseline_no:'历史基线 R'+r.baseline_no}</span></td>
+      <td>#${r.id}</td><td>${r.description}</td><td>${r.status==='completed'
+        ? '已完成 '+r.completed_at : '<span class="badge planned">已计划，待返工完成后取样</span>'}</td></tr>`).join('')+'</table>':'<p class="muted">尚无返工，当前为初始检验基线（返工前）。</p>';
+  const byBase={};d.tests.forEach(t=>(byBase[t.baseline_no]??=[]).push(t));
+  const bases=Object.keys(byBase).map(Number).sort((a,b)=>b-a);
+  const testHtml=bases.map(no=>{
+    const rw=reworks.find(r=>r.baseline_no===no);
+    const tag=no===curBaseline
+      ? `<span class="badge current">当前基线 R${no}${rw?'（返工记录 '+rw.id+'）':''}</span>`
+      : `<span class="badge archive">历史基线 R${no}${rw?'（返工记录 '+rw.id+'）：仅追溯，不作放行依据':'：返工前结果，仅追溯'}</span>`;
+    return `<div class="card">${tag}<table><tr><th>检验项目</th><th>结果</th><th>标准</th><th>轮次</th><th>判定</th><th>记录人/时间</th></tr>`+
+      byBase[no].map(t=>`<tr><td>${t.test_type}</td><td>${t.result}</td><td>${t.spec_min} ~ ${t.spec_max}</td><td>第 ${t.round} 轮</td>
+        <td>${t.passed?'合格':'<span class="bad">不合格</span>'}</td><td>${t.recorded_by} ${t.created_at}</td></tr>`).join('')+'</table></div>';
+  }).join('');
+  $('#detail').innerHTML=`<div class="card"><h2>批次 ${b.batch_no}（${b.state}，修订号 ${b.revision}）</h2>
+    <h3>返工基线</h3>${reworkHtml}
+    ${latest&&latest.status==='planned'?'<div class="warn"><span class="badge planned">返工未完成</span>该批次不能提前取样检验，也不能放行。</div>':''}
+    ${blocked.length?`<div class="warn">当前基线 R${curBaseline} 的 QA 放行/有条件放行将被拒绝：${blocked.join('；')}</div>`:''}
+    <h3>检验记录（按基线分组，历史复测全部可查）</h3>${testHtml||'<p class="muted">尚无检验记录。</p>'}</div>`;
+}
+loadState();
+</script></html>
